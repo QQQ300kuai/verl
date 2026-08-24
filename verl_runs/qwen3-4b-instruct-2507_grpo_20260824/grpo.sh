@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# GRPO | Qwen3-4B-Instruct-2507 (merged SFT) | e-commerce CS tool-calling | FSDP + vLLM
+# Adapted from examples/grpo_trainer/run_qwen3_4b_fsdp.sh.
+#
+# Defaults below target a SINGLE 24GB GPU (e.g. one RTX 4090): trains a
+# verl-side LoRA (not the SFT LoRA -- that one is already merged into the
+# base weights) instead of full-parameter GRPO, since full-parameter actor
+# optimizer state + a separate ref policy copy + the vLLM rollout engine
+# will not fit together on 24GB. With lora_rank>0, verl reuses the actor's
+# base weights for the ref policy (adapters just get disabled), so there is
+# no second full model copy -- see docs/advance/ppo_lora.rst.
+#
+# 1) merge the LoRA SFT adapter into a full HF checkpoint (your own step)
+# 2) train.parquet/test.parquet already built by prepare_data.py -- just
+#    upload them to the server (no need to re-run prepare_data.py there)
+# 3) from the verl repo root, e.g.:
+#   MODEL_PATH=/Users/f/data/code/open-resource-project/LlamaFactory/saves/qwen3-4b/merged/sft_20260823_1124 DATA_DIR=verl_runs/qwen3-4b-instruct-2507_grpo_20260824/data NGPUS_PER_NODE=1 bash verl_runs/qwen3-4b-instruct-2507_grpo_20260824/grpo.sh
+# 
+# adjust NGPUS_PER_NODE/ROLLOUT_TP if you have more than 1 GPU, and
+# TRAIN_BATCH_SIZE/PPO_MINI_BATCH_SIZE/PPO_MICRO_BATCH_SIZE_PER_GPU to GPU memory.
+
+set -xeuo pipefail
+
+DEVICE=${DEVICE:-$(python3 -c 'import torch_npu' 2>/dev/null && echo npu || echo gpu)}
+INFER_BACKEND=${INFER_BACKEND:-vllm}
+
+MODEL_PATH=${MODEL_PATH:?set MODEL_PATH to the merged SFT model dir}
+DATA_DIR=${DATA_DIR:?set DATA_DIR to the dir produced by prepare_data.py}
+TRAIN_FILE=${TRAIN_FILE:-${DATA_DIR}/train.parquet}
+TEST_FILE=${TEST_FILE:-${DATA_DIR}/test.parquet}
+REWARD_FN_PATH=${REWARD_FN_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/reward_fn.py}
+
+NNODES=${NNODES:-1}
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-1}
+
+# ~650 train examples after the 90/10 split, on a single GPU -- keep batches
+# small (both for dataset size and for 24GB memory) and compensate with more
+# epochs + a decent group size (n) so GRPO's per-prompt baseline is
+# estimated from enough samples.
+TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-16}
+PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-8}
+PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}
+LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-1}
+
+# Prompts are one system(tools)+user turn; responses are either a single
+# <tool_call> block or a short direct reply -- both short.
+MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1536}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-256}
+
+# LoRA needs a higher LR than full-parameter fine-tuning (roughly an order
+# of magnitude, per docs/advance/ppo_lora.rst).
+ACTOR_LR=${ACTOR_LR:-1e-5}
+KL_LOSS_COEF=${KL_LOSS_COEF:-0.001}
+ENTROPY_COEFF=${ENTROPY_COEFF:-0}
+
+LORA_RANK=${LORA_RANK:-32}
+LORA_ALPHA=${LORA_ALPHA:-32}
+
+# tensor_model_parallel_size cannot exceed the number of GPUs you have.
+ROLLOUT_TP=${ROLLOUT_TP:-1}
+ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.5}
+ROLLOUT_N=${ROLLOUT_N:-4}
+
+PROJECT_NAME=${PROJECT_NAME:-verl_grpo_ecommerce_cs}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-qwen3_4b_toolcall_grpo}
+SAVE_FREQ=${SAVE_FREQ:-20}
+TEST_FREQ=${TEST_FREQ:-5}
+TOTAL_EPOCHS=${TOTAL_EPOCHS:-30}
+
+case "${DEVICE}" in
+    gpu) ;;
+    npu)
+        export VLLM_USE_V1=1
+        export TASK_QUEUE_ENABLE=2
+        export CPU_AFFINITY_CONF=1
+        export LD_PRELOAD="/usr/lib/aarch64-linux-gnu/libjemalloc.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
+        NGPUS_PER_NODE=16
+        ROLLOUT_GPU_MEM_UTIL=0.9
+        ;;
+    *)
+        echo "Unsupported DEVICE=${DEVICE}. Expected 'gpu' or 'npu'." >&2
+        exit 1
+        ;;
+esac
+
+########################### parameter arrays ###########################
+
+DATA=(
+    algorithm.adv_estimator=grpo
+    data.train_files=${TRAIN_FILE}
+    data.val_files=${TEST_FILE}
+    data.train_batch_size=${TRAIN_BATCH_SIZE}
+    data.max_prompt_length=${MAX_PROMPT_LENGTH}
+    data.max_response_length=${MAX_RESPONSE_LENGTH}
+    data.filter_overlong_prompts=True
+    data.truncation='error'
+    algorithm.use_kl_in_reward=False
+)
+
+MODEL=(
+    actor_rollout_ref.model.path=${MODEL_PATH}
+    actor_rollout_ref.model.use_remove_padding=True
+    actor_rollout_ref.model.enable_gradient_checkpointing=True
+    actor_rollout_ref.model.lora_rank=${LORA_RANK}
+    actor_rollout_ref.model.lora_alpha=${LORA_ALPHA}
+    actor_rollout_ref.model.target_modules=all-linear
+)
+
+ACTOR=(
+    actor_rollout_ref.actor.optim.lr=${ACTOR_LR}
+    actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${PPO_MICRO_BATCH_SIZE_PER_GPU}
+    actor_rollout_ref.actor.use_kl_loss=True
+    actor_rollout_ref.actor.kl_loss_coef=${KL_LOSS_COEF}
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl
+    actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF}
+    actor_rollout_ref.actor.fsdp_config.param_offload=True
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=3000
+    actor_rollout_ref.actor.use_dynamic_bsz=True
+)
+
+ROLLOUT=(
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}
+    actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}
+    actor_rollout_ref.rollout.name=${INFER_BACKEND}
+    actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL}
+    actor_rollout_ref.rollout.enable_chunked_prefill=False
+    actor_rollout_ref.rollout.enforce_eager=False
+    actor_rollout_ref.rollout.free_cache_engine=True
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096
+    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096
+    actor_rollout_ref.rollout.n=${ROLLOUT_N}
+    # required so vLLM can load the base model weights for LoRA
+    actor_rollout_ref.rollout.load_format=safetensors
+)
+
+REF=(
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}
+    actor_rollout_ref.ref.fsdp_config.param_offload=True
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8192
+)
+
+TRAINER=(
+    trainer.critic_warmup=0
+    trainer.logger='["console","wandb"]'
+    trainer.project_name=${PROJECT_NAME}
+    trainer.experiment_name=${EXPERIMENT_NAME}
+    trainer.n_gpus_per_node=${NGPUS_PER_NODE}
+    trainer.nnodes=${NNODES}
+    trainer.save_freq=${SAVE_FREQ}
+    trainer.test_freq=${TEST_FREQ}
+    trainer.total_epochs=${TOTAL_EPOCHS}
+)
+
+# no reward model -- rule-based reward only, see reward_fn.py
+REWARD=(
+    reward_model.enable=False
+    custom_reward_function.path=${REWARD_FN_PATH}
+    custom_reward_function.name=compute_score
+)
+
+EXTRA=(
+)
+
+########################### launch ###########################
+LAUNCH=(python3)
+RAY=(ray_kwargs.ray_init.runtime_env.py_executable=null)
+if [ "${VERL_USE_UV:-1}" != 0 ] && [ "${DEVICE:-gpu}" = gpu ] && { [ "${INFER_BACKEND}" = vllm ] || [ "${INFER_BACKEND}" = sglang ]; }; then
+    LAUNCH=(uv run --frozen --all-packages --extra "${INFER_BACKEND}" --extra fsdp python3)
+    RAY=(ray_kwargs.ray_init.runtime_env.py_executable="uv -v run --frozen --all-packages --extra ${INFER_BACKEND} --extra fsdp")
+fi
+"${LAUNCH[@]}" -m verl.trainer.main_ppo \
+    "${DATA[@]}" \
+    "${MODEL[@]}" \
+    "${ACTOR[@]}" \
+    "${ROLLOUT[@]}" \
+    "${REF[@]}" \
+    "${TRAINER[@]}" \
+    "${REWARD[@]}" \
+    "${EXTRA[@]}" \
+    "${RAY[@]}" \
+    "$@"

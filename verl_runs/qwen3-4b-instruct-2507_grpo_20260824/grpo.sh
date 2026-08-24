@@ -45,6 +45,15 @@ PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-8}
 PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}
 LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-1}
 
+# use_dynamic_bsz=True packs micro-batches by token budget, not the knobs
+# above; headroom was unused (~15/24GB) so raise these to cut micro-batch
+# count. Watch for OOM during update_weights and back off if it happens.
+PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-6000}
+ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU=${ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-8000}
+REF_LOG_PROB_MAX_TOKEN_LEN_PER_GPU=${REF_LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-12000}
+# tried 2048: made update_weights slower (18.75s -> 24.94s), reverted
+UPDATE_WEIGHTS_BUCKET_MB=${UPDATE_WEIGHTS_BUCKET_MB:-1024}
+
 # Prompts are one system(tools)+user turn; responses are either a single
 # <tool_call> block or a short direct reply -- both short.
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1536}
@@ -128,7 +137,7 @@ ACTOR=(
     actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF}
     actor_rollout_ref.actor.fsdp_config.param_offload=False
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=3000
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU}
     actor_rollout_ref.actor.use_dynamic_bsz=True
 )
 
@@ -142,8 +151,8 @@ ROLLOUT=(
     actor_rollout_ref.rollout.enforce_eager=True
     actor_rollout_ref.rollout.free_cache_engine=True
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096
-    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU}
+    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=${UPDATE_WEIGHTS_BUCKET_MB}
     actor_rollout_ref.rollout.n=${ROLLOUT_N}
     # required so vLLM can load the base model weights for LoRA
     actor_rollout_ref.rollout.load_format=safetensors
@@ -156,7 +165,7 @@ REF=(
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}
     actor_rollout_ref.ref.fsdp_config.param_offload=True
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8192
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${REF_LOG_PROB_MAX_TOKEN_LEN_PER_GPU}
 )
 
 TRAINER=(
